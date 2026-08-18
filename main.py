@@ -1,12 +1,25 @@
 """
-KB증권 Open API 자동매매 서버 v5 — 공식 가이드 완전 반영
-수정사항:
-  1. Content-Type: application/json (공식 문서 기준)
-  2. appKey, appSecret 대소문자 정확히 수정
-  3. 서비스 URL: https://developer.kbsec.com:32484 (공식 운영 URL)
+KB증권 Open API 자동매매 서버 v6
+KB증권 고객센터 답변 기준으로 완전 수정
+
+실제 요청 형식:
+POST /oauth2/token
+Content-Type: application/json
+{
+    "dataHeader": {
+        "ipAddr": "실제IP",
+        "macAddr": "실제MAC"
+    },
+    "dataBody": {
+        "appKey": "발급된appKey",
+        "appSecret": "발급된appSecret",
+        "grantType": "client_credentials"
+    }
+}
+
 초기 PIN: 0000
 """
-import json, random, time, os
+import json, random, time, os, socket, uuid
 from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -20,14 +33,15 @@ import uvicorn
 # ── 환경변수 로드 ─────────────────────────────────────
 KB_APP_KEY    = os.getenv("KB_APP_KEY",    "").strip()
 KB_APP_SECRET = os.getenv("KB_APP_SECRET", "").strip()
-# 공식 운영 URL (개발가이드 확인)
 KB_API_URL    = os.getenv("KB_API_URL", "https://developer.kbsec.com:32484").strip()
 
 STATE = {
     "pin": "0000",
     "token": "", "connected": False,
-    "app_key": KB_APP_KEY, "app_secret": KB_APP_SECRET,
-    "api_url": KB_API_URL, "account": "",
+    "app_key": KB_APP_KEY,
+    "app_secret": KB_APP_SECRET,
+    "api_url": KB_API_URL,
+    "account": "",
     "auto_on": False,
     "stop_loss": -5.0, "take_profit": 10.0, "order_amt": 500000,
     "active_strategies": ["RSI 역추세", "MACD 크로스"],
@@ -49,8 +63,30 @@ STOCK_INFO = {
 prices = {}
 
 def add_log(level: str, msg: str):
-    STATE["logs"].insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg})
+    STATE["logs"].insert(0, {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "level": level, "msg": msg
+    })
     STATE["logs"] = STATE["logs"][:100]
+
+def get_local_ip() -> str:
+    """실제 로컬 IP 주소 가져오기"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+def get_mac_addr() -> str:
+    """실제 MAC 주소 가져오기"""
+    try:
+        mac_int = uuid.getnode()
+        return ':'.join(('%012X' % mac_int)[i:i+2] for i in range(0, 12, 2))
+    except:
+        return "00:00:00:00:00:00"
 
 def init_prices():
     for code, info in STOCK_INFO.items():
@@ -82,90 +118,126 @@ def ai_signal(code):
     rsi   = round(max(10,min(90, 50+(p["price"]/base-1)*200+random.uniform(-10,10))),1)
     macd  = random.choice([True,False,False])
     vr    = round(p["volume"]/1_000_000, 2)
-    score = (2 if rsi<35 else -2 if rsi>65 else 0) + (1 if macd else 0) + (1 if vr>1.5 else 0)
-    if score>=2:    sig,conf="buy",  min(95,60+score*8 +random.randint(0,8))
+    score = (2 if rsi<35 else -2 if rsi>65 else 0)+(1 if macd else 0)+(1 if vr>1.5 else 0)
+    if score>=2:    sig,conf="buy",  min(95,60+score*8+random.randint(0,8))
     elif score<=-2: sig,conf="sell", min(95,60+abs(score)*7+random.randint(0,8))
     else:           sig,conf="hold", 35+random.randint(0,20)
-    return {"code":code,"name":p["name"],"signal":sig,"confidence":conf,"rsi":rsi,"macd":macd,"volume_ratio":vr}
+    return {"code":code,"name":p["name"],"signal":sig,"confidence":conf,
+            "rsi":rsi,"macd":macd,"volume_ratio":vr}
 
-# ── KB증권 공식 토큰 발급 ─────────────────────────────
-async def kb_get_token(app_key: str, app_secret: str, api_url: str) -> dict:
+# ── KB증권 공식 토큰 발급 (고객센터 답변 기준) ────────
+async def kb_get_token(app_key: str, app_secret: str, api_url: str,
+                        ip_addr: str = "", mac_addr: str = "") -> dict:
     """
-    KB증권 공식 개발가이드 기준 토큰 발급
-    ✅ Content-Type: application/json
-    ✅ 파라미터: appKey, appSecret (대소문자 정확히)
-    ✅ URL: https://developer.kbsec.com:32484/oauth2/token
+    KB증권 고객센터 답변 기준 토큰 발급
+
+    POST /oauth2/token
+    Content-Type: application/json
+    {
+        "dataHeader": {
+            "ipAddr": "실제IP",
+            "macAddr": "실제MAC"
+        },
+        "dataBody": {
+            "appKey": "발급된appKey",
+            "appSecret": "발급된appSecret",
+            "grantType": "client_credentials"
+        }
+    }
     """
     import httpx
 
+    # IP/MAC 자동 감지
+    if not ip_addr:
+        ip_addr = get_local_ip()
+    if not mac_addr:
+        mac_addr = get_mac_addr()
+
     url = f"{api_url.rstrip('/')}/oauth2/token"
 
-    # ✅ 공식 문서 기준 요청 형식
+    # ✅ KB증권 고객센터 답변 기준 정확한 요청 형식
     headers = {"Content-Type": "application/json"}
-    body    = {
-        "grant_type": "client_credentials",
-        "appKey":     app_key.strip(),    # ✅ 대소문자 주의
-        "appSecret":  app_secret.strip(), # ✅ 대소문자 주의
+    body = {
+        "dataHeader": {
+            "ipAddr":  ip_addr,
+            "macAddr": mac_addr
+        },
+        "dataBody": {
+            "appKey":    app_key.strip(),
+            "appSecret": app_secret.strip(),
+            "grantType": "client_credentials"   # ✅ grantType (camelCase)
+        }
     }
 
     add_log("info", f"토큰 발급 요청 → {url}")
-    add_log("info", f"Content-Type: application/json (공식 기준)")
-    add_log("info", f"appKey 앞 8자리: {app_key[:8]}...")
+    add_log("info", f"IP: {ip_addr} / MAC: {mac_addr}")
+    add_log("info", f"요청 형식: dataHeader + dataBody 구조 (고객센터 기준)")
 
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            verify=False, timeout=15.0, follow_redirects=True
+        ) as client:
             resp = await client.post(url, json=body, headers=headers)
 
         add_log("info", f"HTTP 응답 코드: {resp.status_code}")
+        add_log("info", f"응답 내용: {resp.text[:200]}")
 
         try:
             data = resp.json()
         except Exception:
             add_log("warn", f"JSON 파싱 실패: {resp.text[:200]}")
-            return {"success":False, "message":f"응답 파싱 오류: {resp.text[:100]}"}
+            return {"success": False, "message": f"응답 파싱 오류: {resp.text[:100]}"}
 
-        token = data.get("access_token","")
+        # 성공 체크 (dataBody 안에 access_token)
+        body_resp = data.get("dataBody", data)
+        token = body_resp.get("access_token", "")
+        if not token:
+            token = data.get("access_token", "")
+
         if token:
             add_log("info", "✅ KB증권 토큰 발급 성공!")
-            return {"success":True, "token":token}
+            return {"success": True, "token": token, "data": data}
 
-        hdr = data.get("dataHeader",{})
-        msg = hdr.get("processMessage","알 수 없는 오류")
-        cd  = hdr.get("processCode","?")
-        add_log("warn", f"토큰 발급 실패 [{cd}]: {msg}")
+        # 실패 처리
+        hdr = data.get("dataHeader", {})
+        msg = hdr.get("processMessage", data.get("error_description", "알 수 없는 오류"))
+        cd  = hdr.get("processCode",   data.get("error", "?"))
+        add_log("warn", f"토큰 실패 [{cd}]: {msg}")
         add_log("warn", f"전체 응답: {json.dumps(data, ensure_ascii=False)[:300]}")
-        return {"success":False, "message":f"[{cd}] {msg}", "raw":data}
+        return {"success": False, "message": f"[{cd}] {msg}", "raw": data}
 
     except httpx.ConnectError as e:
-        add_log("warn", f"연결 오류: {e}")
-        return {"success":False, "message":f"서버 연결 실패: {e}"}
+        msg = f"서버 연결 실패: {e}"
+        add_log("warn", msg)
+        return {"success": False, "message": msg}
     except httpx.TimeoutException:
-        add_log("warn", "요청 시간 초과")
-        return {"success":False, "message":"시간 초과 — 잠시 후 재시도"}
+        add_log("warn", "요청 시간 초과 (15초)")
+        return {"success": False, "message": "시간 초과 — 잠시 후 재시도"}
     except Exception as e:
-        add_log("warn", f"오류: {e}")
-        return {"success":False, "message":str(e)}
+        add_log("warn", f"오류: {type(e).__name__}: {e}")
+        return {"success": False, "message": str(e)}
 
 async def auto_get_token():
     if not KB_APP_KEY or not KB_APP_SECRET:
-        add_log("warn", "KB_APP_KEY / KB_APP_SECRET 미설정 → 시뮬레이션 모드")
+        add_log("warn", "환경변수 미설정 → 시뮬레이션 모드")
         return
     result = await kb_get_token(KB_APP_KEY, KB_APP_SECRET, KB_API_URL)
     if result["success"]:
         STATE["token"] = result["token"]
         STATE["connected"] = True
-    else:
-        add_log("warn", f"자동 토큰 실패: {result['message']}")
+        add_log("info", "✅ 자동 토큰 발급 성공!")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_prices()
-    add_log("info", "KB 자동매매 서버 v5 시작 (공식 가이드 완전 반영)")
-    add_log("info", f"API URL: {KB_API_URL}")
+    ip  = get_local_ip()
+    mac = get_mac_addr()
+    add_log("info", f"서버 시작 v6 — IP:{ip} MAC:{mac}")
+    add_log("info", "KB증권 고객센터 답변 기준 요청 형식 적용")
     await auto_get_token()
     yield
 
-app = FastAPI(title="KB Auto Trade v5", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="KB Auto Trade v6", version="6.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -182,9 +254,10 @@ async def root():
 @app.get("/api/status")
 async def status():
     return {
-        "status":"ok","connected":STATE["connected"],
+        "status":"ok", "connected":STATE["connected"],
         "mode":"실제 KB API" if STATE["connected"] else "시뮬레이션",
         "api_url":KB_API_URL, "has_key":bool(KB_APP_KEY),
+        "ip": get_local_ip(), "mac": get_mac_addr(),
         "time":datetime.now().strftime("%H:%M:%S"),
     }
 
@@ -192,7 +265,7 @@ async def status():
 async def get_prices():
     tick_prices()
     return {
-        "status":"ok","data":list(prices.values()),
+        "status":"ok", "data":list(prices.values()),
         "kospi":round(2840+random.uniform(-20,20),2),
         "kosdaq":round(830+random.uniform(-10,10),2),
         "time":datetime.now().strftime("%H:%M:%S"),
@@ -265,13 +338,13 @@ async def auto_run():
             STATE["trade_count"]+=1
             if random.random()>0.4: STATE["win_count"]+=1
             STATE["today_pnl"]+=random.randint(-30000,80000)
-            add_log("buy",f"[AUTO] {s['name']} 매수 {qty}주 @ {p:,}원 (신뢰도{s['confidence']}%)")
+            add_log("buy",f"[AUTO] {s['name']} 매수 {qty}주 @ {p:,}원")
             actions.append({"action":"buy","code":s["code"],"qty":qty,"price":p})
         elif s["signal"]=="sell" and s["confidence"]>=65:
             STATE["trade_count"]+=1
             if random.random()>0.35: STATE["win_count"]+=1
             STATE["today_pnl"]+=random.randint(-20000,60000)
-            add_log("sell",f"[AUTO] {s['name']} 매도 신호 (신뢰도{s['confidence']}%)")
+            add_log("sell",f"[AUTO] {s['name']} 매도 신호")
     wr=round(STATE["win_count"]/max(1,STATE["trade_count"])*100)
     return {"status":"ok","actions":actions,
             "stats":{"trade_count":STATE["trade_count"],"win_rate":wr,"today_pnl":STATE["today_pnl"]}}
@@ -313,22 +386,59 @@ async def place_order(req: OrderReq):
     return {"status":"ok","order":order}
 
 class TokenReq(BaseModel):
-    app_key:str; app_secret:str
-    api_url:str="https://developer.kbsec.com:32484"
-    account:str=""
+    app_key:    str
+    app_secret: str
+    api_url:    str = "https://developer.kbsec.com:32484"
+    account:    str = ""
+    ip_addr:    str = ""
+    mac_addr:   str = ""
 
 @app.post("/api/token")
 async def get_token(req: TokenReq):
-    STATE.update({"app_key":req.app_key.strip(),"app_secret":req.app_secret.strip(),
-                  "api_url":req.api_url.strip(),"account":req.account.strip()})
-    result = await kb_get_token(req.app_key.strip(), req.app_secret.strip(), req.api_url.strip())
+    """KB증권 고객센터 답변 기준 토큰 발급"""
+    STATE.update({
+        "app_key":    req.app_key.strip(),
+        "app_secret": req.app_secret.strip(),
+        "api_url":    req.api_url.strip(),
+        "account":    req.account.strip(),
+    })
+
+    # IP/MAC 자동 감지 또는 사용자 입력값 사용
+    ip  = req.ip_addr  or get_local_ip()
+    mac = req.mac_addr or get_mac_addr()
+
+    add_log("info", f"수동 토큰 발급 시작 — IP:{ip} MAC:{mac}")
+
+    result = await kb_get_token(
+        req.app_key.strip(),
+        req.app_secret.strip(),
+        req.api_url.strip(),
+        ip_addr=ip,
+        mac_addr=mac,
+    )
+
     if result["success"]:
-        STATE["token"]=result["token"]; STATE["connected"]=True
-        return {"status":"ok","message":"✅ 토큰 발급 성공! 실제 KB API 연결됨"}
-    STATE["connected"]=False
-    return {"status":"error","message":result["message"],
-            "raw":result.get("raw",{}),
-            "tip":"openapi.kbsec.com → 마이페이지에서 appKey/appSecret 다시 확인"}
+        STATE["token"]     = result["token"]
+        STATE["connected"] = True
+        return {
+            "status":  "ok",
+            "message": "✅ 토큰 발급 성공! 실제 KB API 연결됨",
+            "token_preview": result["token"][:20]+"..."
+        }
+    else:
+        STATE["connected"] = False
+        return {
+            "status":  "error",
+            "message": result["message"],
+            "raw":     result.get("raw", {}),
+            "request_format": {
+                "url":  f"{req.api_url}/oauth2/token",
+                "body": {
+                    "dataHeader": {"ipAddr":ip,"macAddr":mac},
+                    "dataBody":   {"appKey":"***","appSecret":"***","grantType":"client_credentials"}
+                }
+            }
+        }
 
 class AutoReq(BaseModel):
     enabled: bool
@@ -336,7 +446,8 @@ class AutoReq(BaseModel):
 @app.post("/api/auto")
 async def set_auto(req: AutoReq):
     STATE["auto_on"]=req.enabled
-    add_log("info" if req.enabled else "warn",f"AI 자동매매 {'시작' if req.enabled else '중지'}")
+    add_log("info" if req.enabled else "warn",
+            f"AI 자동매매 {'시작' if req.enabled else '중지'}")
     return {"status":"ok","auto_on":STATE["auto_on"]}
 
 class StratReq(BaseModel):
@@ -350,8 +461,9 @@ async def save_strategy(req: StratReq):
     if req.order_amt:         STATE["order_amt"]=req.order_amt
     if req.active_strategies: STATE["active_strategies"]=req.active_strategies
     txt=req.text.lower()
-    rules=[r for k,r in [("rsi","RSI 규칙"),("macd","MACD 규칙"),("볼린저","볼린저밴드 규칙"),
-           ("이동평균","이동평균 규칙"),("거래량","거래량 규칙")] if k in txt]
+    rules=[r for k,r in [("rsi","RSI 규칙"),("macd","MACD 규칙"),
+           ("볼린저","볼린저밴드 규칙"),("이동평균","이동평균 규칙"),
+           ("거래량","거래량 규칙")] if k in txt]
     if not rules: rules=[f"사용자 규칙 {random.randint(2,8)}개"]
     add_log("info",f"전략 학습: {', '.join(rules)}")
     return {"status":"ok","rules":rules}
@@ -364,8 +476,9 @@ async def add_watchlist(code: str):
             STOCK_INFO[code]={"name":code,"base":random.randint(5000,200000),"sector":"기타"}
         if code not in prices:
             b=STOCK_INFO[code]["base"]; chg=round(random.uniform(-3,5),2)
-            prices[code]={"code":code,"name":code,"sector":"기타","price":round(b*(1+chg/100)),
-                          "chg":chg,"volume":random.randint(100000,1000000),
+            prices[code]={"code":code,"name":code,"sector":"기타",
+                          "price":round(b*(1+chg/100)),"chg":chg,
+                          "volume":random.randint(100000,1000000),
                           "high":round(b*1.02),"low":round(b*0.98),
                           "updated":datetime.now().strftime("%H:%M:%S")}
         add_log("info",f"종목 추가: {code}")
@@ -373,13 +486,15 @@ async def add_watchlist(code: str):
 
 if __name__=="__main__":
     port=int(os.getenv("PORT",8000))
+    ip  = get_local_ip()
+    mac = get_mac_addr()
     print(f"\n{'='*55}")
-    print(f"  KB 자동매매 v5 — 공식 가이드 완전 반영")
+    print(f"  KB 자동매매 v6 — 고객센터 기준 완전 수정")
     print(f"  주소: http://localhost:{port}")
     print(f"  PIN: 0000")
-    print(f"  API URL: {KB_API_URL}")
-    print(f"  Content-Type: application/json ✅")
-    print(f"  appKey/appSecret 대소문자 수정 ✅")
-    print(f"  KB_APP_KEY: {'설정됨 ✅' if KB_APP_KEY else '미설정 ❌'}")
+    print(f"  내 IP: {ip}")
+    print(f"  내 MAC: {mac}")
+    print(f"  요청형식: dataHeader+dataBody 구조 ✅")
+    print(f"  grantType (camelCase) ✅")
     print(f"{'='*55}\n")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
